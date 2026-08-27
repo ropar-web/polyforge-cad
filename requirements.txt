@@ -1,0 +1,9 @@
+streamlit==1.62.0
+cadquery==2.8.0
+plotly==6.5.2
+numpy>=2.0,<3
+pillow>=11,<13
+opencv-python-headless>=4.10,<5
+shapely>=2.0,<3
+cairosvg>=2.7,<3
+psutil>=6,<8
