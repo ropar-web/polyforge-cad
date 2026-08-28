@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from io import BytesIO
 from typing import List, Sequence, Tuple
 
@@ -10,8 +8,17 @@ from shapely.geometry import Polygon
 
 
 def _ensure_gray(data: bytes) -> np.ndarray:
-    im = Image.open(BytesIO(data)).convert("L")
-    return np.array(im)
+    """Decode an image to grayscale while treating transparency as white.
+
+    SVG rasterizers and transparent PNGs commonly store transparent pixels as
+    black RGB values with alpha=0. Converting those directly to grayscale makes
+    the transparent canvas look black, so contour tracing detects the whole
+    image rectangle instead of the artwork. Composite onto white first.
+    """
+    im = Image.open(BytesIO(data)).convert("RGBA")
+    white = Image.new("RGBA", im.size, (255, 255, 255, 255))
+    white.alpha_composite(im)
+    return np.array(white.convert("L"))
 
 
 def trace_bitmap(
@@ -109,4 +116,8 @@ def rasterize_svg(svg_bytes: bytes, output_width: int = 1800) -> bytes:
     """
     import cairosvg
 
-    return cairosvg.svg2png(bytestring=svg_bytes, output_width=int(output_width))
+    return cairosvg.svg2png(
+        bytestring=svg_bytes,
+        output_width=int(output_width),
+        background_color="#ffffff",
+    )
