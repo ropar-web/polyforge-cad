@@ -415,3 +415,173 @@ def polygons_to_svg(polygons: Sequence[Polygon], padding: float = 0.0) -> str:
         ds.append(ring_d(p.exterior.coords))
         ds.extend(ring_d(r.coords) for r in p.interiors)
     return f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w+2*pad:.6f} {h+2*pad:.6f}"><path d="{" ".join(ds)}" fill="#000" fill-rule="evenodd"/></svg>'
+
+# ---------------- Detailed colour-layer image tracing ----------------
+def _rgba_over_white(data: bytes):
+    im = Image.open(BytesIO(data)).convert('RGBA')
+    arr = np.array(im)
+    alpha = arr[..., 3]
+    rgb = arr[..., :3].astype(np.float32)
+    a = alpha[..., None].astype(np.float32) / 255.0
+    comp = rgb * a + 255.0 * (1.0 - a)
+    return comp.astype(np.uint8), alpha
+
+
+def _cluster_color_hex(bgr_or_rgb):
+    r, g, b = [int(round(float(x))) for x in bgr_or_rgb]
+    return f'#{r:02x}{g:02x}{b:02x}'
+
+
+def _mask_to_polygons(mask: np.ndarray, simplify: float = 0.15, min_area: float = 20.0):
+    """Convert one binary colour mask to polygons while preserving direct child holes."""
+    contours, hierarchy = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+    if hierarchy is None:
+        return []
+    hierarchy = hierarchy[0]
+    h_img = mask.shape[0]
+    result = []
+    for i, c in enumerate(contours):
+        # parent == -1 => exterior contour
+        if hierarchy[i][3] != -1:
+            continue
+        if abs(cv2.contourArea(c)) < float(min_area):
+            continue
+        peri = cv2.arcLength(c, True)
+        eps = max(0.02, float(simplify) / 100.0 * peri)
+        outer = cv2.approxPolyDP(c, eps, True)[:, 0, :]
+        if len(outer) < 3:
+            continue
+        shell = [(float(x), float(h_img-y)) for x, y in outer]
+        holes = []
+        child = hierarchy[i][2]
+        while child != -1:
+            hc = contours[child]
+            if abs(cv2.contourArea(hc)) >= float(min_area):
+                hp = cv2.approxPolyDP(hc, max(0.02, float(simplify)/100.0*cv2.arcLength(hc, True)), True)[:,0,:]
+                if len(hp) >= 3:
+                    holes.append([(float(x), float(h_img-y)) for x,y in hp])
+            child = hierarchy[child][0]
+        p = Polygon(shell, holes).buffer(0)
+        if p.is_empty:
+            continue
+        if isinstance(p, MultiPolygon):
+            result.extend([g for g in p.geoms if g.area >= float(min_area)])
+        elif p.area >= float(min_area):
+            result.append(p)
+    return result
+
+
+def trace_color_layers(
+    data: bytes,
+    colors: int = 6,
+    simplify: float = 0.15,
+    min_area: float = 30.0,
+    background_tolerance: float = 24.0,
+    max_parts: int = 64,
+):
+    """Trace a raster image into separate filled colour regions.
+
+    Background is estimated from the image border and automatically excluded. Transparent
+    pixels are always background. Returns (layers, preview_png, svg, metadata).
+    Each layer is {'name','color','polygons','area'}.
+    """
+    rgb, alpha = _rgba_over_white(data)
+    oh, ow = rgb.shape[:2]
+    scale = min(1.0, 900.0 / max(oh, ow))
+    if scale < 1.0:
+        rgb_small = cv2.resize(rgb, (max(2,int(ow*scale)), max(2,int(oh*scale))), interpolation=cv2.INTER_AREA)
+        alpha_small = cv2.resize(alpha, (rgb_small.shape[1], rgb_small.shape[0]), interpolation=cv2.INTER_AREA)
+    else:
+        rgb_small, alpha_small = rgb, alpha
+    h, w = rgb_small.shape[:2]
+
+    # Lab gives more perceptual colour grouping than raw RGB.
+    lab = cv2.cvtColor(rgb_small, cv2.COLOR_RGB2LAB)
+    pixels = lab.reshape((-1,3)).astype(np.float32)
+    k = int(max(2, min(int(colors), 12, len(pixels))))
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 35, 0.8)
+    _compact, labels, centers = cv2.kmeans(pixels, k, None, criteria, 4, cv2.KMEANS_PP_CENTERS)
+    labels = labels.reshape((h,w))
+
+    # Border pixels define likely background. Use majority cluster among opaque-ish border.
+    border_mask = np.zeros((h,w), np.uint8)
+    bw = max(1, int(round(min(h,w)*0.035)))
+    border_mask[:bw,:]=1; border_mask[-bw:,:]=1; border_mask[:,:bw]=1; border_mask[:,-bw:]=1
+    opaque_border = (border_mask.astype(bool) & (alpha_small > 20))
+    border_labels = labels[opaque_border]
+    if border_labels.size:
+        counts = np.bincount(border_labels, minlength=k)
+        bg_cluster = int(np.argmax(counts))
+    else:
+        bg_cluster = 0
+
+    # Also identify clusters visually close to the dominant border colour as background.
+    bg_center = centers[bg_cluster]
+    bg_clusters = {bg_cluster}
+    for ci, cen in enumerate(centers):
+        if float(np.linalg.norm(cen-bg_center)) <= float(background_tolerance):
+            bg_clusters.add(ci)
+
+    # Convert center colours back to RGB for layer display.
+    center_lab_u8 = np.clip(centers,0,255).astype(np.uint8).reshape((-1,1,3))
+    center_rgb = cv2.cvtColor(center_lab_u8, cv2.COLOR_LAB2RGB).reshape((-1,3))
+
+    layers = []
+    preview = np.full((h,w,3), 255, np.uint8)
+    kernel = np.ones((3,3), np.uint8)
+    for ci in range(k):
+        if ci in bg_clusters:
+            continue
+        mask = ((labels == ci) & (alpha_small > 20)).astype(np.uint8)*255
+        # Remove isolated k-means speckle, then close 1-pixel gaps.
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        if cv2.countNonZero(mask) < min_area:
+            continue
+        polys = _mask_to_polygons(mask, simplify=simplify, min_area=min_area)
+        if not polys:
+            continue
+        # Scale polygons back to original image coordinate scale.
+        invs = 1.0/scale
+        if abs(invs-1.0) > 1e-9:
+            from shapely.affinity import scale as shp_scale
+            polys = [shp_scale(p, xfact=invs, yfact=invs, origin=(0,0)) for p in polys]
+        col = tuple(int(x) for x in center_rgb[ci])
+        area = sum(p.area for p in polys)
+        layers.append({'name':f'Layer {len(layers)+1}', 'color':_cluster_color_hex(col), 'rgb':col, 'polygons':polys, 'area':area})
+        preview[mask>0] = np.array(col, np.uint8)
+
+    layers.sort(key=lambda x:x['area'], reverse=True)
+    # Limit individual geometry count globally, keeping largest regions first.
+    total = 0
+    trimmed=[]
+    for layer in layers:
+        ps=sorted(layer['polygons'], key=lambda p:p.area, reverse=True)
+        keep=ps[:max(0,int(max_parts)-total)]
+        if keep:
+            nl=dict(layer); nl['polygons']=keep; nl['area']=sum(p.area for p in keep); trimmed.append(nl); total += len(keep)
+        if total >= int(max_parts): break
+    layers=trimmed
+
+    # SVG preserves each layer colour and its holes.
+    all_polys=[p for layer in layers for p in layer['polygons']]
+    if not all_polys:
+        raise ValueError('No non-background artwork regions were detected. Try fewer colours or reduce background tolerance.')
+    union=unary_union(all_polys); minx,miny,maxx,maxy=union.bounds
+    vw=maxx-minx; vh=maxy-miny
+    def pd(p):
+        def ring(coords):
+            return 'M '+' L '.join(f'{x-minx:.3f} {maxy-y:.3f}' for x,y in coords)+' Z'
+        return ' '.join([ring(p.exterior.coords)] + [ring(r.coords) for r in p.interiors])
+    elems=[]
+    for li,layer in enumerate(layers):
+        for p in layer['polygons']:
+            elems.append(f'<path d="{pd(p)}" fill="{layer["color"]}" fill-rule="evenodd" data-layer="{li}"/>')
+    svg=f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {vw:.3f} {vh:.3f}">' + ''.join(elems) + '</svg>'
+
+    ok, enc = cv2.imencode('.png', cv2.cvtColor(preview, cv2.COLOR_RGB2BGR))
+    preview_png = enc.tobytes() if ok else b''
+    return layers, preview_png, svg, {
+        'source':'detailed_color_layers', 'layers':len(layers), 'regions':sum(len(x['polygons']) for x in layers),
+        'background_cluster':bg_cluster, 'background_clusters':sorted(bg_clusters), 'original_size':(ow,oh)
+    }

@@ -19,6 +19,7 @@ from image_tools import (
     trace_bitmap,
     svg_to_polygons,
     polygons_to_svg,
+    trace_color_layers,
 )
 from preview import figure_for_shape
 
@@ -61,6 +62,7 @@ def init_state():
         "trace_original_preview": None,
         "trace_original_svg": None,
         "trace_meta": None,
+        "trace_layers": None,
         "scene_specs": [],
         "split_parts": {},
     }
@@ -387,14 +389,20 @@ if page == "Image → SVG → 3D":
             max_parts = st.slider("Maximum separate vector regions", 1, 80, 32)
             st.caption("Threshold, blur and bitmap smoothing are intentionally bypassed for SVGs so the vector artwork is not distorted.")
         else:
+            raster_mode = st.radio("Image conversion mode", ["Detailed layered", "Simple silhouette"], horizontal=True)
             c1, c2 = st.columns(2)
-            threshold = c1.slider("Threshold", 0, 255, 165, 1)
-            simplify = c2.slider("Smooth / simplify", 0.02, 2.0, 0.22, 0.02, help="Higher values remove more small nodes.")
-            blur = c1.selectbox("Blur before trace", [0, 3, 5, 7], index=0)
+            simplify = c2.slider("Smooth / simplify", 0.02, 2.0, 0.16, 0.02, help="Higher values remove more small nodes.")
             min_area = c2.number_input("Ignore details smaller than (px²)", 1.0, 5000.0, 30.0, 5.0)
-            invert = st.checkbox("Invert foreground/background", False)
-            external = st.checkbox("Outer regions only", True)
-            max_parts = st.slider("Maximum detected parts", 1, 40, 16)
+            max_parts = st.slider("Maximum detected parts", 1, 80, 40)
+            if raster_mode == "Detailed layered":
+                colour_count = c1.slider("Colour/detail layers", 2, 12, 6)
+                bg_tolerance = c1.slider("Background removal tolerance", 5.0, 70.0, 24.0, 1.0, help="Higher removes more colours similar to the image border/background.")
+                st.caption("The app samples the image border to identify the background, removes it, then keeps internal colour regions as separate vectors.")
+            else:
+                threshold = c1.slider("Threshold", 0, 255, 165, 1)
+                blur = c1.selectbox("Blur before trace", [0, 3, 5, 7], index=0)
+                invert = st.checkbox("Invert foreground/background", False)
+                external = st.checkbox("Outer regions only", True)
 
         if upload and st.button("Import artwork", type="primary", use_container_width=True):
             try:
@@ -412,21 +420,37 @@ if page == "Image → SVG → 3D":
                     st.session_state.trace_original_preview = preview
                     st.session_state.trace_original_svg = raw
                     st.session_state.trace_meta = meta
+                    st.session_state.trace_layers = None
                     st.success(f"Imported {len(polys)} vector region(s) directly — no bitmap retracing.")
                 else:
-                    contours, binary, size = trace_bitmap(raw, threshold, invert, int(blur), simplify, min_area, external)
-                    contours = contours[:max_parts]
-                    polys = contours_to_polygons(contours, size, max_parts=max_parts)
-                    svg = contours_to_svg(contours, size)
-                    st.session_state.trace_contours = contours
-                    st.session_state.trace_size = size
-                    st.session_state.trace_polygons = polys
-                    st.session_state.trace_svg = svg
-                    st.session_state.trace_binary = binary_preview_png(binary)
-                    st.session_state.trace_original_preview = raw
-                    st.session_state.trace_original_svg = None
-                    st.session_state.trace_meta = {"source":"bitmap_trace","regions":len(polys)}
-                    st.success(f"Detected {len(polys)} printable region(s).")
+                    if raster_mode == "Detailed layered":
+                        layers, layer_preview, svg, meta = trace_color_layers(raw, colour_count, simplify, min_area, bg_tolerance, max_parts)
+                        polys = [p for layer in layers for p in layer["polygons"]]
+                        st.session_state.trace_contours = None
+                        st.session_state.trace_size = meta.get("original_size")
+                        st.session_state.trace_polygons = polys
+                        st.session_state.trace_layers = layers
+                        st.session_state.trace_svg = svg
+                        st.session_state.trace_binary = layer_preview
+                        st.session_state.trace_original_preview = raw
+                        st.session_state.trace_original_svg = None
+                        st.session_state.trace_meta = meta
+                        st.success(f"Removed background and detected {meta['layers']} colour layer(s) / {meta['regions']} vector region(s).")
+                    else:
+                        contours, binary, size = trace_bitmap(raw, threshold, invert, int(blur), simplify, min_area, external)
+                        contours = contours[:max_parts]
+                        polys = contours_to_polygons(contours, size, max_parts=max_parts)
+                        svg = contours_to_svg(contours, size)
+                        st.session_state.trace_contours = contours
+                        st.session_state.trace_size = size
+                        st.session_state.trace_polygons = polys
+                        st.session_state.trace_layers = None
+                        st.session_state.trace_svg = svg
+                        st.session_state.trace_binary = binary_preview_png(binary)
+                        st.session_state.trace_original_preview = raw
+                        st.session_state.trace_original_svg = None
+                        st.session_state.trace_meta = {"source":"bitmap_trace","regions":len(polys)}
+                        st.success(f"Detected {len(polys)} printable region(s).")
             except Exception as e:
                 st.error(f"Import failed: {e}")
 
@@ -478,9 +502,16 @@ if page == "Image → SVG → 3D":
             st.image(st.session_state.trace_original_preview, use_container_width=True)
         if st.session_state.get("trace_svg"):
             st.subheader("CAD vector preview")
-            _svg_preview_png = rasterize_svg(st.session_state.trace_svg.encode("utf-8"), output_width=1600)
-            st.image(_svg_preview_png, caption="This is the vector geometry used to create the 3D model.", use_container_width=True)
+            _vector_png = rasterize_svg(st.session_state.trace_svg.encode("utf-8"), 1400)
+            st.image(_vector_png, caption="Background has been removed. Coloured regions are separate vector artwork layers.", use_container_width=True)
             meta = st.session_state.get("trace_meta") or {}
+            if meta.get("source") == "detailed_color_layers":
+                c1,c2=st.columns(2)
+                c1.metric("Colour layers", meta.get("layers",0))
+                c2.metric("Vector regions", meta.get("regions",0))
+                with st.expander("Detected layers"):
+                    for idx, layer in enumerate(st.session_state.get("trace_layers") or []):
+                        st.write(f"{idx+1}. {layer['color']} — {len(layer['polygons'])} region(s)")
             if meta.get("source") == "direct_svg_vector":
                 c1,c2,c3=st.columns(3)
                 c1.metric("Vector regions", meta.get("regions",0))
