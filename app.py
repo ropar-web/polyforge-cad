@@ -478,7 +478,11 @@ if page == "Image → SVG → 3D":
             st.image(st.session_state.trace_original_preview, use_container_width=True)
         if st.session_state.get("trace_svg"):
             st.subheader("CAD vector preview")
-            st.image(st.session_state.trace_svg.encode("utf-8"), caption="This is the vector geometry used to create the 3D model.", use_container_width=True)
+            try:
+                _svg_png = rasterize_svg(st.session_state.trace_svg.encode("utf-8"), output_width=1800)
+                st.image(_svg_png, caption="This is the vector geometry used to create the 3D model.", use_container_width=True)
+            except Exception as _preview_error:
+                st.warning(f"Vector preview could not be rendered: {_preview_error}")
             meta = st.session_state.get("trace_meta") or {}
             if meta.get("source") == "direct_svg_vector":
                 c1,c2,c3=st.columns(3)
