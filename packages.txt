@@ -3,3 +3,4 @@ libglu1-mesa
 libxrender1
 libxext6
 libsm6
+libcairo2
