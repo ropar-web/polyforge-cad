@@ -478,7 +478,7 @@ if page == "Image → SVG → 3D":
             st.image(st.session_state.trace_original_preview, use_container_width=True)
         if st.session_state.get("trace_svg"):
             st.subheader("CAD vector preview")
-            _svg_preview_png = it.rasterize_svg(st.session_state.trace_svg.encode("utf-8"), output_width=1600)
+            _svg_preview_png = rasterize_svg(st.session_state.trace_svg.encode("utf-8"), output_width=1600)
             st.image(_svg_preview_png, caption="This is the vector geometry used to create the 3D model.", use_container_width=True)
             meta = st.session_state.get("trace_meta") or {}
             if meta.get("source") == "direct_svg_vector":
